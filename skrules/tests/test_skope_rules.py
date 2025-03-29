@@ -3,9 +3,10 @@ Testing for SkopeRules algorithm (skrules.skope_rules).
 """
 
 import numpy as np
-
+import pandas as pd
+import pytest
 from sklearn.model_selection import ParameterGrid
-from sklearn.datasets import load_iris, load_boston, make_blobs
+from sklearn.datasets import load_iris, make_blobs
 from sklearn.metrics import accuracy_score
 
 from sklearn.utils import check_random_state
@@ -32,12 +33,6 @@ perm = rng.permutation(iris.target.size)
 iris.data = iris.data[perm]
 iris.target = iris.target[perm]
 
-# also load the boston dataset
-# and randomly permute it
-boston = load_boston()
-perm = rng.permutation(boston.target.size)
-boston.data = boston.data[perm]
-boston.target = boston.target[perm]
 
 
 def test_skope_rules():
@@ -227,3 +222,102 @@ def test_f1_score():
     assert_equal(clf.f1_score(rule0), 0)
     assert_equal(clf.f1_score(rule1), 0.5)
     assert_equal(clf.f1_score(rule2), 0)
+
+
+def test_query_handling():
+    """Test the query handling functionality with various edge cases."""
+    # Create a simple dataset
+    X = pd.DataFrame({
+        '__C__0': [1, 2, 3, 4, 5],
+        '__C__1': [1.5, 2.5, 3.5, 4.5, 5.5],
+        '__C__2': [2.0, 3.0, 4.0, 5.0, 6.0]
+    })
+    y = np.array([0, 0, 1, 1, 1])
+
+    # Initialize SkopeRules with verbose mode
+    clf = SkopeRules(verbose=1)
+    
+    # Test different query patterns
+    test_queries = [
+        "__C__0 <= 3",  # Simple query
+        "__C__0 <= 3 and __C__1 <= 3.5",  # AND query
+        "(__C__0 <= 3) & (__C__1 <= 3.5)",  # Query with parentheses and &
+        "((__C__0 <= 3) & (__C__1 <= 3.5)) & (__C__2 <= 4.0)",  # Nested query
+        "__C__0 == __C__0",  # Default rule
+    ]
+    
+    for query in test_queries:
+        result = clf._safe_query(X, query)
+        assert isinstance(result, pd.DataFrame), f"Query failed: {query}"
+        assert len(result) > 0, f"Empty result for query: {query}"
+
+
+def test_rule_generation():
+    """Test rule generation with the iris dataset."""
+    # Load iris dataset
+    iris = load_iris()
+    X = pd.DataFrame(iris.data, columns=[f'__C__{i}' for i in range(4)])
+    y = iris.target == 0  # Binary classification
+    
+    # Initialize SkopeRules with verbose mode
+    clf = SkopeRules(
+        feature_names=iris.feature_names,
+        precision_min=0.3,
+        recall_min=0.1,
+        n_estimators=10,
+        max_depth=3,
+        verbose=1
+    )
+    
+    # Fit the classifier
+    clf.fit(X, y)
+    
+    # Test predictions
+    y_pred = clf.predict(X)
+    assert isinstance(y_pred, np.ndarray)
+    assert len(y_pred) == len(y)
+    
+    # Test rules
+    assert len(clf.rules_) > 0, "No rules generated"
+    
+    # Test each rule
+    for rule, _ in clf.rules_:
+        # Verify rule format
+        assert isinstance(rule, str)
+        assert "and" in rule.lower() or "<=" in rule or ">" in rule
+        
+        # Test rule application
+        result = clf._safe_query(X, rule)
+        assert isinstance(result, pd.DataFrame)
+
+
+def test_edge_cases():
+    """Test edge cases and potential error conditions."""
+    X = pd.DataFrame({
+        '__C__0': [1, 2, 3],
+        '__C__1': [1.5, 2.5, 3.5]
+    })
+    y = np.array([0, 1, 1])
+    
+    clf = SkopeRules(verbose=1)
+    
+    # Test empty query
+    result = clf._safe_query(X, "")
+    assert isinstance(result, pd.DataFrame)
+    
+    # Test invalid query
+    result = clf._safe_query(X, "invalid_column <= 3")
+    assert isinstance(result, pd.DataFrame)
+    assert len(result) == 0
+    
+    # Test query with special characters
+    result = clf._safe_query(X, "__C__0 <= 3\n and __C__1 <= 3.5")
+    assert isinstance(result, pd.DataFrame)
+    
+    # Test query with multiple conditions
+    result = clf._safe_query(X, "__C__0 <= 3 and __C__1 <= 3.5 and __C__0 > 1")
+    assert isinstance(result, pd.DataFrame)
+
+
+if __name__ == '__main__':
+    pytest.main([__file__])
