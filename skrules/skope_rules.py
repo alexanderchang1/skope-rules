@@ -16,7 +16,7 @@ from sklearn.tree import _tree
 from .rule import Rule, replace_feature_name
 
 INTEGER_TYPES = (numbers.Integral, np.integer)
-BASE_FEATURE_NAME = "__C__"
+BASE_FEATURE_NAME = "C"
 
 
 class SkopeRules(BaseEstimator):
@@ -145,7 +145,7 @@ class SkopeRules(BaseEstimator):
                  n_estimators=10,
                  max_samples=.8,
                  max_samples_features=1.,
-                 bootstrap=False,
+                 bootstrap=True,
                  bootstrap_features=False,
                  max_depth=3,
                  max_depth_duplication=None,
@@ -267,36 +267,33 @@ class SkopeRules(BaseEstimator):
             if isinstance(self.max_depth, Iterable) else [self.max_depth]
 
         for max_depth in self._max_depths:
+            # Convert 'auto' to 'sqrt' for backward compatibility
+            max_features_param = 'sqrt' if self.max_features == 'auto' else self.max_features
+            
             bagging_clf = BaggingClassifier(
-                base_estimator=DecisionTreeClassifier(
+                estimator=DecisionTreeClassifier(
                     max_depth=max_depth,
-                    max_features=self.max_features,
+                    max_features=max_features_param,
                     min_samples_split=self.min_samples_split),
                 n_estimators=self.n_estimators,
                 max_samples=self.max_samples_,
                 max_features=self.max_samples_features,
                 bootstrap=self.bootstrap,
                 bootstrap_features=self.bootstrap_features,
-                # oob_score=... XXX may be added
-                # if selection on tree perf needed.
-                # warm_start=... XXX may be added to increase computation perf.
                 n_jobs=self.n_jobs,
                 random_state=self.random_state,
                 verbose=self.verbose)
 
             bagging_reg = BaggingRegressor(
-                base_estimator=DecisionTreeRegressor(
+                estimator=DecisionTreeRegressor(
                     max_depth=max_depth,
-                    max_features=self.max_features,
+                    max_features=max_features_param,
                     min_samples_split=self.min_samples_split),
                 n_estimators=self.n_estimators,
                 max_samples=self.max_samples_,
                 max_features=self.max_samples_features,
                 bootstrap=self.bootstrap,
                 bootstrap_features=self.bootstrap_features,
-                # oob_score=... XXX may be added
-                # if selection on tree perf needed.
-                # warm_start=... XXX may be added to increase computation perf.
                 n_jobs=self.n_jobs,
                 random_state=self.random_state,
                 verbose=self.verbose)
@@ -338,10 +335,11 @@ class SkopeRules(BaseEstimator):
             mask = ~indices_to_mask(samples, n_samples)            
                         
             if sum(mask) == 0:
-                warn("OOB evaluation not possible: doing it in-bag."
-                     " Performance evaluation is likely to be wrong"
-                     " (overfitting) and selected rules are likely to"
-                     " not perform well! Please use max_samples < 1.")
+                if not self.bootstrap:
+                    warn("OOB evaluation not possible: doing it in-bag."
+                         " Performance evaluation is likely to be wrong"
+                         " (overfitting) and selected rules are likely to"
+                         " not perform well! Please use bootstrap=True or max_samples < 1.")
                 mask = samples
             rules_from_tree = self._tree_to_rules(
                 estimator, np.array(self.feature_names_)[features])
@@ -452,9 +450,23 @@ class SkopeRules(BaseEstimator):
         selected_rules = self.rules_without_feature_names_
 
         scores = np.zeros(X.shape[0])
+        total_weights = np.zeros(X.shape[0])
+        
         for (r, w) in selected_rules:
-            scores[list(df.query(r).index)] += w[0]
-
+            matched_samples = list(self._safe_query(df, r).index)
+            scores[matched_samples] += w[0]  # Add precision as weight
+            total_weights[matched_samples] += 1
+            
+        # Normalize scores by number of matching rules, avoiding division by zero
+        mask = total_weights > 0
+        if np.any(mask):
+            scores[mask] = scores[mask] / total_weights[mask]
+        
+        # Center the scores around 0 for better outlier detection
+        if len(scores) > 0:
+            mean_score = np.mean(scores)
+            scores = scores - mean_score
+            
         return scores
 
     def rules_vote(self, X):
@@ -494,7 +506,7 @@ class SkopeRules(BaseEstimator):
 
         scores = np.zeros(X.shape[0])
         for (r, _) in selected_rules:
-            scores[list(df.query(r).index)] += 1
+            scores[list(self._safe_query(df, r).index)] += 1
 
         return scores
 
@@ -536,9 +548,9 @@ class SkopeRules(BaseEstimator):
 
         scores = np.zeros(X.shape[0])
         for (k, r) in enumerate(list((selected_rules))):
-            scores[list(df.query(r[0]).index)] = np.maximum(
+            scores[list(self._safe_query(df, r[0]).index)] = np.maximum(
                 len(selected_rules) - k,
-                scores[list(df.query(r[0]).index)])
+                scores[list(self._safe_query(df, r[0]).index)])
 
         return scores
 
@@ -580,9 +592,6 @@ class SkopeRules(BaseEstimator):
         -------
         rules : list of rules.
         """
-        # XXX todo: check the case where tree is build on subset of features,
-        # ie max_features != None
-
         tree_ = tree.tree_
         feature_name = [
             feature_names[i] if i != _tree.TREE_UNDEFINED else "undefined!"
@@ -593,36 +602,175 @@ class SkopeRules(BaseEstimator):
         def recurse(node, base_name):
             if tree_.feature[node] != _tree.TREE_UNDEFINED:
                 name = feature_name[node]
-                symbol = '<='
-                symbol2 = '>'
                 threshold = tree_.threshold[node]
-                text = base_name + ["{} {} {}".format(name, symbol, threshold)]
-                recurse(tree_.children_left[node], text)
-
-                text = base_name + ["{} {} {}".format(name, symbol2,
-                                                      threshold)]
-                recurse(tree_.children_right[node], text)
+                
+                # Format conditions without parentheses and with proper spacing
+                left_rule = f"{name} <= {threshold:.6f}"
+                right_rule = f"{name} > {threshold:.6f}"
+                
+                if base_name:
+                    # Join conditions with proper spacing and no parentheses
+                    left_conditions = base_name + [left_rule]
+                    right_conditions = base_name + [right_rule]
+                else:
+                    left_conditions = [left_rule]
+                    right_conditions = [right_rule]
+                
+                recurse(tree_.children_left[node], left_conditions)
+                recurse(tree_.children_right[node], right_conditions)
             else:
-                rule = str.join(' and ', base_name)
-                rule = (rule if rule != ''
-                        else ' == '.join([feature_names[0]] * 2))
-                # a rule selecting all is set to "c0==c0"
-                rules.append(rule)
+                if base_name:
+                    # Join conditions with 'and' and proper spacing
+                    rule = ' and '.join(base_name)
+                    rules.append(rule)
+                else:
+                    # Use a simple equality for default rule
+                    default_rule = f"{feature_names[0]} == {feature_names[0]}"
+                    rules.append(default_rule)
 
         recurse(0, [])
-
         return rules if len(rules) > 0 else 'True'
 
+    def _safe_query(self, df, query_str):
+        """Safely evaluate a pandas query string by sanitizing the expression."""
+        try:
+            if self.verbose:
+                print(f"\nDEBUG: Original query string: {repr(query_str)}")
+            
+            # Clean up the query string
+            query_str = query_str.replace('\n', ' ').replace('\r', ' ')
+            
+            # Replace multiple spaces with single space and strip
+            query_str = ' '.join(query_str.split()).strip()
+            
+            # If query is empty, return empty DataFrame with same columns
+            if not query_str:
+                return df.iloc[0:0]
+            
+            # Handle default rule case - return all rows for expressions like "column == column"
+            if " == " in query_str:
+                parts = query_str.split(" == ")
+                if len(parts) == 2 and parts[0].strip() == parts[1].strip():
+                    if parts[0].strip() in df.columns:
+                        return df.copy()
+                    else:
+                        return df.iloc[0:0]
+            
+            # Remove parentheses and convert & to and
+            query_str = query_str.replace('(', '').replace(')', '')
+            query_str = query_str.replace('&', 'and')
+            
+            # Split on 'and' operator
+            conditions = query_str.split(' and ')
+            
+            # Clean up each condition
+            cleaned_conditions = []
+            for condition in conditions:
+                # Remove extra whitespace
+                condition = condition.strip()
+                
+                # Skip empty or duplicate conditions
+                if condition and condition not in cleaned_conditions:
+                    cleaned_conditions.append(condition)
+            
+            if self.verbose:
+                print(f"DEBUG: Cleaned conditions: {cleaned_conditions}")
+            
+            # Apply conditions sequentially
+            result = df
+            for condition in cleaned_conditions:
+                try:
+                    if self.verbose:
+                        print(f"DEBUG: Applying condition: {repr(condition)}")
+                    
+                    # Parse the condition
+                    parts = condition.split()
+                    if len(parts) < 3:
+                        if self.verbose:
+                            print(f"DEBUG: Invalid condition format: {condition}")
+                        continue
+                    
+                    column = parts[0]
+                    operator = parts[1]
+                    value_str = ' '.join(parts[2:])
+                    
+                    # Check if the column exists
+                    if column not in df.columns:
+                        if self.verbose:
+                            print(f"DEBUG: Column {column} not found in DataFrame")
+                        return df.iloc[0:0]
+                    
+                    # Convert value to appropriate type (try numeric first)
+                    try:
+                        value = float(value_str)
+                    except ValueError:
+                        value = value_str
+                    
+                    # Apply the condition without using query()
+                    if operator == "<=":
+                        result = result[result[column] <= value]
+                    elif operator == "<":
+                        result = result[result[column] < value]
+                    elif operator == ">":
+                        result = result[result[column] > value]
+                    elif operator == ">=":
+                        result = result[result[column] >= value]
+                    elif operator == "==":
+                        result = result[result[column] == value]
+                    elif operator == "!=":
+                        result = result[result[column] != value]
+                    else:
+                        if self.verbose:
+                            print(f"DEBUG: Unsupported operator: {operator}")
+                        continue
+                        
+                except Exception as e:
+                    if self.verbose:
+                        print(f"DEBUG: Failed to apply condition {repr(condition)}: {str(e)}")
+                    continue
+            
+            return result
+                
+        except Exception as e:
+            if self.verbose:
+                print(f"DEBUG: Query failed with error: {str(e)}")
+                print(f"DEBUG: Failed query string: {repr(query_str)}")
+            warn(f"Query evaluation failed: {str(e)}")
+            return df.iloc[0:0]
+
     def _eval_rule_perf(self, rule, X, y):
-        detected_index = list(X.query(rule).index)
+        """Evaluate rule performance using safe query evaluation."""
+        if self.verbose:
+            print(f"\nDEBUG: Evaluating rule performance for: {repr(rule)}")
+        
+        detected_index = list(self._safe_query(X, rule).index)
+        
+        if self.verbose:
+            print(f"DEBUG: Number of detected samples: {len(detected_index)}")
+        
         if len(detected_index) <= 1:
+            if self.verbose:
+                print("DEBUG: Too few samples detected, returning (0, 0)")
             return (0, 0)
+            
         y_detected = y[detected_index]
         true_pos = y_detected[y_detected > 0].sum()
+        
+        if self.verbose:
+            print(f"DEBUG: True positives: {true_pos}")
+        
         if true_pos == 0:
+            if self.verbose:
+                print("DEBUG: No true positives, returning (0, 0)")
             return (0, 0)
+            
         pos = y[y > 0].sum()
-        return y_detected.mean(), float(true_pos) / pos
+        result = (y_detected.mean(), float(true_pos) / pos)
+        
+        if self.verbose:
+            print(f"DEBUG: Rule performance (precision, recall): {result}")
+        
+        return result
 
     def deduplicate(self, rules):
         return [max(rules_set, key=self.f1_score)
